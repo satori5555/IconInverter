@@ -188,11 +188,27 @@ public:
     bool loadIco(const std::string& filename) {
         std::ifstream file(filename, std::ios::binary);
         if (!file) return false;
+
         file.seekg(0, std::ios::end);
-        size_t size = file.tellg(); file.seekg(0);
+        std::streampos end = file.tellg();
+
+        // 安全判断：文件是否为空或无法读取
+        if (end <= 0) return false;
+
+        size_t size = static_cast<size_t>(end);
+        file.seekg(0);
+
         fileData.resize(size);
         file.read(reinterpret_cast<char*>(fileData.data()), size);
+
+        // 进一步安全判断：实际读取大小是否正确
+        if (!file) return false;
+
+        if (size < sizeof(IconDir)) return false;
         std::memcpy(&header, fileData.data(), sizeof(IconDir));
+
+        if (header.count == 0 || size < sizeof(IconDir) + header.count * sizeof(IconDirEntry)) return false;
+
         entries.resize(header.count);
         std::memcpy(entries.data(), fileData.data() + sizeof(IconDir), sizeof(IconDirEntry) * header.count);
         return true;
