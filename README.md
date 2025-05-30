@@ -76,18 +76,6 @@ cmake --build . --config Release
 
 ---
 
-## 📄 示例效果
-
-原始图标：
-
-![original](./images/sample-before.png)
-
-亮度反转后：
-
-![inverted](./images/sample-after.png)
-
----
-
 ## 🧑‍💻 作者
 
 **古明地 さとり (923957033@qq.com)**
