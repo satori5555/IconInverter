@@ -184,77 +184,229 @@ private:
     std::vector<uint8_t> fileData;
     IconDir header;
     std::vector<IconDirEntry> entries;
+
+    bool isPngAt(size_t offset) const {
+        if (fileData.size() < offset + 8) return false;
+        static const uint8_t pngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+        return std::memcmp(fileData.data() + offset, pngSig, 8) == 0;
+    }
+
+    bool tryRepairIco() {
+        // 先尝试 PNG
+        std::cout << "[Repair] 尝试自动修复损坏 ICO..." << std::endl;
+        // 1. 搜索 PNG
+        auto pngIt = std::search(fileData.begin(), fileData.end(),
+            "\x89PNG\r\n\x1A\n", "\x89PNG\r\n\x1A\n" + 8);
+        if (pngIt != fileData.end()) {
+            size_t pngOffset = std::distance(fileData.begin(), pngIt);
+            size_t pngLen = fileData.size() - pngOffset;
+            cv::Mat tmp = cv::imdecode(std::vector<uint8_t>(fileData.begin() + pngOffset, fileData.end()), cv::IMREAD_UNCHANGED);
+            if (!tmp.empty()) {
+                // 重组 ICO
+                IconDir newHeader{ 0, 1, 1 };
+                IconDirEntry newEntry{};
+                newEntry.width = static_cast<uint8_t>(tmp.cols);
+                newEntry.height = static_cast<uint8_t>(tmp.rows);
+                newEntry.colorCount = 0;
+                newEntry.reserved = 0;
+                newEntry.planes = 1;
+                newEntry.bitCount = 32;
+                newEntry.bytesInRes = static_cast<uint32_t>(pngLen);
+                newEntry.imageOffset = sizeof(IconDir) + sizeof(IconDirEntry);
+
+                fileData.resize(sizeof(IconDir) + sizeof(IconDirEntry) + pngLen);
+                std::memcpy(fileData.data(), &newHeader, sizeof(IconDir));
+                std::memcpy(fileData.data() + sizeof(IconDir), &newEntry, sizeof(IconDirEntry));
+                std::memcpy(fileData.data() + sizeof(IconDir) + sizeof(IconDirEntry),
+                    fileData.data() + pngOffset, pngLen);
+
+                header = newHeader;
+                entries.clear();
+                entries.push_back(newEntry);
+                std::cout << "[Repair] ICO 修复成功，已提取单一 32 位 PNG 图标\n";
+                return true;
+            }
+        }
+        // 2. 搜索 BMP/DIB 32位图
+        for (size_t offset = 0; offset + sizeof(BitmapInfoHeader) < fileData.size(); offset++) {
+            const BitmapInfoHeader* bih = reinterpret_cast<const BitmapInfoHeader*>(fileData.data() + offset);
+            if (bih->size == 40 && bih->width > 0 && bih->height > 0 &&
+                (bih->bitCount == 32 || bih->bitCount == 24) &&
+                bih->planes == 1) {
+                // 计算像素块大小，ICO 的 DIB 是 height*2，后面有 AND mask
+                int width = bih->width;
+                int height = bih->height / 2;
+                size_t dibSize = sizeof(BitmapInfoHeader) + width * height * (bih->bitCount / 8);
+                // 容错：不越界
+                if (offset + dibSize > fileData.size()) continue;
+                // 可解码，生成新的 ICO
+                IconDir newHeader{ 0, 1, 1 };
+                IconDirEntry newEntry{};
+                newEntry.width = static_cast<uint8_t>(width);
+                newEntry.height = static_cast<uint8_t>(height);
+                newEntry.colorCount = 0;
+                newEntry.reserved = 0;
+                newEntry.planes = 1;
+                newEntry.bitCount = bih->bitCount;
+                newEntry.bytesInRes = static_cast<uint32_t>(dibSize);
+                newEntry.imageOffset = sizeof(IconDir) + sizeof(IconDirEntry);
+
+                // 新数据
+                std::vector<uint8_t> newFile(sizeof(IconDir) + sizeof(IconDirEntry) + dibSize);
+                std::memcpy(newFile.data(), &newHeader, sizeof(IconDir));
+                std::memcpy(newFile.data() + sizeof(IconDir), &newEntry, sizeof(IconDirEntry));
+                std::memcpy(newFile.data() + sizeof(IconDir) + sizeof(IconDirEntry),
+                    fileData.data() + offset, dibSize);
+
+                fileData = std::move(newFile);
+                header = newHeader;
+                entries.clear();
+                entries.push_back(newEntry);
+                std::cout << "[Repair] ICO 修复成功，已提取单一 32 位 BMP 图标\n";
+                return true;
+            }
+        }
+        std::cerr << "[Repair] 未找到有效 PNG 或 BMP 区块，修复失败\n";
+        return false;
+    }
+
 public:
     bool loadIco(const std::string& filename) {
         std::ifstream file(filename, std::ios::binary);
         if (!file) return false;
-
         file.seekg(0, std::ios::end);
-        std::streampos end = file.tellg();
-
-        // 安全判断：文件是否为空或无法读取
-        if (end <= 0) return false;
-
-        size_t size = static_cast<size_t>(end);
+        size_t size = file.tellg();
         file.seekg(0);
-
         fileData.resize(size);
         file.read(reinterpret_cast<char*>(fileData.data()), size);
-
-        // 进一步安全判断：实际读取大小是否正确
         if (!file) return false;
-
         if (size < sizeof(IconDir)) return false;
         std::memcpy(&header, fileData.data(), sizeof(IconDir));
-
-        if (header.count == 0 || size < sizeof(IconDir) + header.count * sizeof(IconDirEntry)) return false;
-
-        entries.resize(header.count);
-        std::memcpy(entries.data(), fileData.data() + sizeof(IconDir), sizeof(IconDirEntry) * header.count);
+        if (header.count == 0) return false;
+        entries.clear();
+        size_t entryTableEnd = sizeof(IconDir) + header.count * sizeof(IconDirEntry);
+        size_t validCount = 0;
+        if (entryTableEnd > size) {
+            size_t maxCount = (size > sizeof(IconDir)) ? (size - sizeof(IconDir)) / sizeof(IconDirEntry) : 0;
+            for (size_t i = 0; i < maxCount; ++i) {
+                IconDirEntry entry;
+                std::memcpy(&entry, fileData.data() + sizeof(IconDir) + i * sizeof(IconDirEntry), sizeof(IconDirEntry));
+                if (entry.imageOffset + entry.bytesInRes <= size)
+                    ++validCount;
+                entries.push_back(entry);
+            }
+        }
+        else {
+            for (size_t i = 0; i < header.count; ++i) {
+                IconDirEntry entry;
+                std::memcpy(&entry, fileData.data() + sizeof(IconDir) + i * sizeof(IconDirEntry), sizeof(IconDirEntry));
+                if (entry.imageOffset + entry.bytesInRes <= size)
+                    ++validCount;
+                entries.push_back(entry);
+            }
+        }
+        if (entries.empty() || validCount == 0) {
+            std::cerr << "[Warning] ICO 条目无效，尝试修复...\n";
+            if (!tryRepairIco()) {
+                std::cerr << "[Error] ICO 修复失败，彻底跳过\n";
+                return false;
+            }
+        }
         return true;
     }
 
-    void processHslInversion() {
+	void processHslInversion() {
+        bool hasValidImage = false; // 统计至少有1个 entry 能处理
+        size_t entryTableEnd = sizeof(IconDir) + entries.size() * sizeof(IconDirEntry);
         for (size_t i = 0; i < entries.size(); ++i) {
-            const auto& entry = entries[i];
+            auto& entry = entries[i];
             size_t offset = entry.imageOffset;
-
-            if (offset + sizeof(BitmapInfoHeader) > fileData.size()) {
-                std::cerr << "图像头超出范围，跳过第 " << i << " 个 ICO 图像\n";
+            size_t sizeInRes = entry.bytesInRes;
+            // 防止 offset 指到文件头、条目表内，或超出文件尾
+            if (offset + sizeInRes > fileData.size() || offset < entryTableEnd) {
+                std::cerr << "[Warning] 图像数据超出范围，跳过第 " << i << " 个 ICO 图像\n";
                 continue;
             }
+            hasValidImage = true;
 
-            BitmapInfoHeader bih;
-            std::memcpy(&bih, fileData.data() + offset, sizeof(BitmapInfoHeader));
-
-            if (bih.bitCount != 32) continue;
-
-            int width = bih.width;
-            int height = bih.height / 2;
-            size_t dataOffset = offset + sizeof(BitmapInfoHeader);
-            size_t available = fileData.size() - dataOffset;
-
-            size_t maxPixels = available / 4;
-            int safeHeight = std::min(height, static_cast<int>(maxPixels / width));
-
-            if (safeHeight < height) {
-                std::cerr << "像素数据不足，图像高度裁剪为 " << safeHeight << "\n";
-            }
-
-            for (int y = 0; y < safeHeight; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    size_t pix = dataOffset + ((safeHeight - 1 - y) * width + x) * 4;
-                    if (pix + 3 >= fileData.size()) continue;
-
-                    RGB rgb{ fileData[pix + 2], fileData[pix + 1], fileData[pix + 0], fileData[pix + 3] };
-                    HSL hsl = rgbToHsl(rgb);
-                    hsl.l = 1.0f - hsl.l;
-                    RGB newRgb = hslToRgb(hsl);
-                    fileData[pix + 0] = newRgb.b;
-                    fileData[pix + 1] = newRgb.g;
-                    fileData[pix + 2] = newRgb.r;
+            if (isPngAt(offset)) {
+                std::vector<uint8_t> pngData(fileData.begin() + offset, fileData.begin() + offset + sizeInRes);
+                cv::Mat img = cv::imdecode(pngData, cv::IMREAD_UNCHANGED);
+                if (img.empty()) {
+                    std::cerr << "[Warning] PNG 解码失败, 跳过第 " << i << " 个\n";
+                    continue;
+                }
+                if (img.channels() == 4) {
+                    for (int y = 0; y < img.rows; ++y) {
+                        for (int x = 0; x < img.cols; ++x) {
+                            cv::Vec4b& pix = img.at<cv::Vec4b>(y, x);
+                            RGB rgb{ pix[2], pix[1], pix[0], pix[3] };
+                            HSL hsl = rgbToHsl(rgb);
+                            hsl.l = 1.0f - hsl.l;
+                            RGB newRgb = hslToRgb(hsl);
+                            pix[0] = newRgb.b;
+                            pix[1] = newRgb.g;
+                            pix[2] = newRgb.r;
+                            pix[3] = rgb.a;
+                        }
+                    }
+                }
+                else {
+                    invertBrightness(img);
+                }
+                std::vector<uint8_t> outPng;
+                cv::imencode(".png", img, outPng);
+                if (outPng.size() <= sizeInRes) {
+                    std::copy(outPng.begin(), outPng.end(), fileData.begin() + offset);
+                    std::fill(fileData.begin() + offset + outPng.size(), fileData.begin() + offset + sizeInRes, 0);
+                    entry.bytesInRes = static_cast<uint32_t>(outPng.size());
+                }
+                else {
+                    size_t newOffset = fileData.size();
+                    fileData.insert(fileData.end(), outPng.begin(), outPng.end());
+                    entry.imageOffset = static_cast<uint32_t>(newOffset);
+                    entry.bytesInRes = static_cast<uint32_t>(outPng.size());
                 }
             }
+            else {
+                // BMP 逻辑
+                if (sizeInRes < sizeof(BitmapInfoHeader)) {
+                    std::cerr << "[Warning] BMP 数据过小，跳过第 " << i << " 个\n";
+                    continue;
+                }
+                BitmapInfoHeader bih;
+                std::memcpy(&bih, fileData.data() + offset, sizeof(BitmapInfoHeader));
+                if (bih.bitCount != 32) {
+                    std::cerr << "[Warning] 非32位BMP，跳过第 " << i << " 个\n";
+                    continue;
+                }
+                int width = bih.width;
+                int height = bih.height / 2;
+                size_t dataOffset = offset + sizeof(BitmapInfoHeader);
+                size_t available = fileData.size() - dataOffset;
+                size_t maxPixels = available / 4;
+                int safeHeight = std::min(height, static_cast<int>(maxPixels / width));
+                for (int y = 0; y < safeHeight; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        size_t pix = dataOffset + ((safeHeight - 1 - y) * width + x) * 4;
+                        if (pix + 3 >= fileData.size()) continue;
+                        RGB rgb{ fileData[pix + 2], fileData[pix + 1], fileData[pix + 0], fileData[pix + 3] };
+                        HSL hsl = rgbToHsl(rgb);
+                        hsl.l = 1.0f - hsl.l;
+                        RGB newRgb = hslToRgb(hsl);
+                        fileData[pix + 0] = newRgb.b;
+                        fileData[pix + 1] = newRgb.g;
+                        fileData[pix + 2] = newRgb.r;
+                    }
+                }
+            }
+        }
+        if (!hasValidImage) {
+            std::cerr << "[Info] 该 ICO 没有任何有效图像条目，仅跳过\n";
+        }
+        // 写回新的 IconDirEntry
+        if (!entries.empty()) {
+            std::memcpy(fileData.data() + sizeof(IconDir), entries.data(), sizeof(IconDirEntry) * entries.size());
         }
     }
 
@@ -266,7 +418,66 @@ public:
     }
 };
 
-// 根据文件类型进行单个文件处理
+// ------------------- 兜底自动修复 --------------------------
+
+/// OpenCV 兜底强解 ICO -> PNG -> 反色 -> 再自动打包为 ICO（只保留主图层）
+bool recoverIcoViaImage(const std::string& inputPath, const std::string& outputPath) {
+    // 1. 尝试 OpenCV 强解 ICO
+    cv::Mat img = cv::imread(inputPath, cv::IMREAD_UNCHANGED);
+    if (img.empty()) {
+        // 部分“伪ICO”其实直接是 PNG 数据
+        std::ifstream fin(inputPath, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(fin)), {});
+        img = cv::imdecode(buf, cv::IMREAD_UNCHANGED);
+    }
+    if (img.empty()) return false;
+
+    // 2. 反色处理
+    if (img.channels() == 4) {
+        for (int y = 0; y < img.rows; ++y)
+            for (int x = 0; x < img.cols; ++x) {
+                cv::Vec4b& pix = img.at<cv::Vec4b>(y, x);
+                RGB rgb{ pix[2], pix[1], pix[0], pix[3] };
+                HSL hsl = rgbToHsl(rgb);
+                hsl.l = 1.0f - hsl.l;
+                RGB out = hslToRgb(hsl);
+                pix[0] = out.b; pix[1] = out.g; pix[2] = out.r; // alpha不变
+            }
+    }
+    else {
+        invertBrightness(img);
+    }
+
+    // 3. 打包为 ICO 格式（PNG嵌入法，通用兼容 Windows 7-11）
+    std::vector<uchar> pngBuf;
+    if (!cv::imencode(".png", img, pngBuf)) return false;
+    // 生成 ICO 结构
+    struct IconDir { uint16_t reserved, type, count; };
+    struct IconDirEntry {
+        uint8_t width, height, colorCount, reserved;
+        uint16_t planes, bitCount;
+        uint32_t bytesInRes, imageOffset;
+    };
+    IconDir header{ 0, 1, 1 };
+    IconDirEntry entry{};
+    entry.width = (uint8_t)img.cols;
+    entry.height = (uint8_t)img.rows;
+    entry.colorCount = 0;
+    entry.reserved = 0;
+    entry.planes = 1;
+    entry.bitCount = 32;
+    entry.bytesInRes = (uint32_t)pngBuf.size();
+    entry.imageOffset = sizeof(header) + sizeof(entry);
+
+    std::ofstream out(outputPath, std::ios::binary);
+    if (!out) return false;
+    out.write((const char*)&header, sizeof(header));
+    out.write((const char*)&entry, sizeof(entry));
+    out.write((const char*)pngBuf.data(), pngBuf.size());
+    return true;
+}
+
+// -------------- 文件分派 -----------------
 void processFile(const fs::path& input, const fs::path& output) {
     std::string ext = input.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -283,11 +494,15 @@ void processFile(const fs::path& input, const fs::path& output) {
                 proc.saveIco(output.string());
             }
             else {
-                std::cerr << "无法加载 ICO: " << input << "\n";
+                // 兜底恢复
+                std::cerr << "[Recover] 尝试 OpenCV 强解 ICO..." << std::endl;
+                if (!recoverIcoViaImage(input.string(), output.string())) {
+                    std::cerr << "无法加载 ICO: " << input << "\n";
+                }
             }
         }
         else if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
-            cv::Mat img = cv::imread(input.string());
+            cv::Mat img = cv::imread(input.string(), cv::IMREAD_UNCHANGED);
             if (!img.empty()) {
                 invertBrightness(img);
                 cv::imwrite(output.string(), img);
@@ -305,14 +520,11 @@ void processFile(const fs::path& input, const fs::path& output) {
     }
 }
 
-// 遍历目录，批量处理所有图标
 void batchProcess(const std::string& inputDir, const std::string& outputDir) {
     for (const auto& entry : fs::recursive_directory_iterator(inputDir)) {
         if (!entry.is_regular_file()) continue;
-
         fs::path relative = fs::relative(entry.path(), inputDir);
         fs::path outPath = fs::path(outputDir) / relative;
-
         processFile(entry.path(), outPath);
         std::cout << "已处理: " << entry.path() << "\n";
     }
@@ -320,7 +532,6 @@ void batchProcess(const std::string& inputDir, const std::string& outputDir) {
 
 int main(int argc, char* argv[]) {
     std::string inDir, outDir;
-
     if (argc >= 3) {
         inDir = argv[1];
         outDir = argv[2];
@@ -328,11 +539,9 @@ int main(int argc, char* argv[]) {
     else {
         std::cout << "请输入图标输入目录路径: ";
         std::getline(std::cin, inDir);
-
         std::cout << "请输入图标输出目录路径: ";
         std::getline(std::cin, outDir);
     }
-
     std::cout << "图标亮度反转工具启动\n输入目录: " << inDir << "\n输出目录: " << outDir << "\n\n";
     batchProcess(inDir, outDir);
     std::cout << "\n全部处理完成！\n";
