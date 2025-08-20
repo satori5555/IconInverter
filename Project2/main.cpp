@@ -48,6 +48,8 @@
 #include <filesystem>
 #include <opencv2/opencv.hpp>
 #include "tinyxml2.h"
+#include <regex>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 using namespace tinyxml2;
@@ -148,6 +150,84 @@ std::string rgbToHex(RGB rgb) {
     return std::string(buf);
 }
 
+// 小工具：去空白 & 小写
+static inline std::string trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n"); if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");  return s.substr(b, e - b + 1);
+}
+static inline std::string lower(std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; }
+
+// 解析 #RGB / #RRGGBB / #RRGGBBAA（忽略 alpha）
+bool parseHexColor(const std::string& hex, RGB& out) {
+    if (hex.empty() || hex[0] != '#') return false;
+    std::string s = hex;
+    if (s.size() == 4) { // #RGB
+        int r = std::stoi(s.substr(1, 1), nullptr, 16);
+        int g = std::stoi(s.substr(2, 1), nullptr, 16);
+        int b = std::stoi(s.substr(3, 1), nullptr, 16);
+        out = RGB{ uint8_t(r * 17), uint8_t(g * 17), uint8_t(b * 17), 255 };
+        return true;
+    }
+    else if (s.size() == 7 || s.size() == 9) { // #RRGGBB / #RRGGBBAA
+        int r = std::stoi(s.substr(1, 2), nullptr, 16);
+        int g = std::stoi(s.substr(3, 2), nullptr, 16);
+        int b = std::stoi(s.substr(5, 2), nullptr, 16);
+        out = RGB{ uint8_t(r), uint8_t(g), uint8_t(b), 255 };
+        return true;
+    }
+    return false;
+}
+
+// 解析 rgb(...) / rgba(...)，支持空格
+bool parseRgbFunc(const std::string& val, RGB& out) {
+    std::regex re(R"(rgba?\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})(?:\s*,\s*([0-9]*\.?[0-9]+|[0-9]{1,3}%))?\s*\))",
+        std::regex::icase);
+    std::smatch m;
+    if (!std::regex_match(val, m, re)) return false;
+    int r = std::min(255, std::max(0, std::stoi(m[1].str())));
+    int g = std::min(255, std::max(0, std::stoi(m[2].str())));
+    int b = std::min(255, std::max(0, std::stoi(m[3].str())));
+    out = RGB{ uint8_t(r), uint8_t(g), uint8_t(b), 255 };
+    return true;
+}
+
+// 少量常见命名色（够用即可；需要更多可自行补充）
+bool parseNamedColor(const std::string& val, RGB& out) {
+    static const std::unordered_map<std::string, RGB> m = {
+        {"black",{0,0,0,255}}, {"white",{255,255,255,255}}, {"red",{255,0,0,255}},
+        {"green",{0,128,0,255}}, {"blue",{0,0,255,255}}, {"gray",{128,128,128,255}},
+        {"grey",{128,128,128,255}}, {"silver",{192,192,192,255}}, {"maroon",{128,0,0,255}}
+    };
+    auto it = m.find(lower(trim(val)));
+    if (it == m.end()) return false;
+    out = it->second; return true;
+}
+
+// 统一入口：把颜色字符串解析成 RGB（支持 #hex / rgb(...) / 命名色）
+// 遇到 "none"、"transparent"、"currentColor"、"url(#...)" 直接返回 false（不处理）
+bool parseColorString(const std::string& raw, RGB& out) {
+    std::string s = lower(trim(raw));
+    if (s.empty()) return false;
+    if (s == "none" || s == "transparent" || s == "currentcolor") return false;
+    if (s.rfind("url(", 0) == 0) return false; // 渐变/引用，跳过
+    RGB rgb;
+    if (parseHexColor(s, rgb)) { out = rgb; return true; }
+    if (parseRgbFunc(s, rgb)) { out = rgb; return true; }
+    if (parseNamedColor(s, rgb)) { out = rgb; return true; }
+    return false;
+}
+
+// 反转亮度：输入颜色字符串 -> 返回新的十六进制颜色
+bool invertColorString(const std::string& in, std::string& outHex) {
+    RGB rgb;
+    if (!parseColorString(in, rgb)) return false;
+    HSL hsl = rgbToHsl(rgb);
+    hsl.l = 1.0f - hsl.l;
+    RGB inv = hslToRgb(hsl);
+    outHex = rgbToHex(inv);  // 统一输出 #RRGGBB
+    return true;
+}
+
 // 处理 SVG 文件中的 fill 和 stroke 属性，进行亮度反转
 void processSvgFile(const fs::path& input, const fs::path& output) {
     XMLDocument doc;
@@ -156,24 +236,83 @@ void processSvgFile(const fs::path& input, const fs::path& output) {
         return;
     }
 
-    auto processAttr = [](XMLElement* elem, const char* attrName) {
+    // 需要处理的颜色型属性（可自行扩展）
+    static const char* kColorAttrs[] = {
+        "fill", "stroke", "stop-color", "flood-color", "lighting-color", "color",
+        "customFrame" // 你这份 SVG 里出现了这个自定义字段
+    };
+
+    auto tryProcessAttr = [&](XMLElement* elem, const char* attrName) {
         const char* val = elem->Attribute(attrName);
-        if (val && val[0] == '#') {
-            RGB rgb = hexToRgb(val);
-            HSL hsl = rgbToHsl(rgb);
-            hsl.l = 1.0f - hsl.l;
-            RGB newRgb = hslToRgb(hsl);
-            elem->SetAttribute(attrName, rgbToHex(newRgb).c_str());
+        if (!val) return;
+        std::string newHex;
+        if (invertColorString(val, newHex)) {
+            elem->SetAttribute(attrName, newHex.c_str());
         }
         };
 
-    std::function<void(XMLElement*)> traverse = [&](XMLElement* e) {
-        processAttr(e, "fill");
-        processAttr(e, "stroke");
-        for (XMLElement* c = e->FirstChildElement(); c; c = c->NextSiblingElement()) traverse(c);
-        };
-    traverse(doc.RootElement());
+    auto processStyleAttr = [&](XMLElement* elem) {
+        const char* style = elem->Attribute("style");
+        if (!style) return;
+        std::string s = style;
 
+        // 简单解析 style="a:b; c:d;"，只改与颜色相关的键
+        // 注意：这里不处理复合的 CSS 选择器或变量；够覆盖常见 SVG 图标
+        std::string out; out.reserve(s.size() + 16);
+        size_t i = 0;
+        while (i < s.size()) {
+            // 取 key
+            size_t keyBeg = i;
+            size_t colon = s.find(':', i);
+            if (colon == std::string::npos) { out.append(s.substr(i)); break; }
+            std::string key = trim(s.substr(keyBeg, colon - keyBeg));
+            // 取 value
+            size_t semi = s.find(';', colon + 1);
+            std::string val = trim(s.substr(colon + 1, (semi == std::string::npos ? s.size() : semi) - (colon + 1)));
+
+            // 是否颜色键
+            bool isColorKey = false;
+            for (const char* k : kColorAttrs) {
+                if (lower(key) == lower(k)) { isColorKey = true; break; }
+            }
+
+            if (isColorKey) {
+                std::string newHex;
+                if (invertColorString(val, newHex)) {
+                    val = newHex; // 替换为 #RRGGBB
+                }
+            }
+
+            // 还原
+            out.append(key);
+            out.append(": ");
+            out.append(val);
+            if (semi != std::string::npos) {
+                out.push_back(';');
+                i = semi + 1;
+            }
+            else {
+                i = s.size();
+            }
+        }
+
+        elem->SetAttribute("style", out.c_str());
+        };
+
+    std::function<void(XMLElement*)> traverse = [&](XMLElement* e) {
+        // 1) 直接属性
+        for (const char* name : kColorAttrs) {
+            tryProcessAttr(e, name);
+        }
+        // 2) style 属性里的颜色
+        processStyleAttr(e);
+        // 3) 递归子元素
+        for (XMLElement* c = e->FirstChildElement(); c; c = c->NextSiblingElement()) {
+            traverse(c);
+        }
+        };
+
+    traverse(doc.RootElement());
     fs::create_directories(output.parent_path());
     doc.SaveFile(output.string().c_str());
 }
